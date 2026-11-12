@@ -1,0 +1,6 @@
+option('spa-plugindir', type : 'string', value : '',
+  description : 'Install root for SPA plugins (default: <prefix>/<libdir>/spa-0.2)')
+option('tests', type : 'boolean', value : true,
+  description : 'Build the unit tests and the test CLAP plugin')
+option('systemd-user-unit', type : 'boolean', value : true,
+  description : 'Install the clap-pw-host@.service user unit template (not enabled)')
