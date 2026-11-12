@@ -1,0 +1,15 @@
+# Run ~/.config/clap-pipewire/%i.conf as a CLAP effect host.
+#   systemctl --user enable --now clap-pw-host@my-effect
+[Unit]
+Description=CLAP effect host for %i (clap-pipewire)
+After=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/clap-pw-host %i
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=pipewire.service

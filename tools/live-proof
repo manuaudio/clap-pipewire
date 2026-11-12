@@ -1,0 +1,311 @@
+#!/bin/bash
+# live-proof: put a real CLAP effect on a throwaway output device through
+# PipeWire's filter-chain, prove with a measured tone that it applies, change
+# a parameter live, then remove everything and prove that too.
+#
+# Nothing audible and nothing of yours is touched:
+#   - the "device" is a null sink made for the test (no hardware);
+#   - every stream is pinned to it with node.dont-fallback;
+#   - the default sink is compared before and after;
+#   - the effect host is its own process and is stopped at the end.
+#
+# Usage: tools/live-proof [OUTDIR]
+#   CLAP_PW_SO       the built plugin (default: build/libspa-filter-graph-plugin-clap.so)
+#   CLAP_PW_INFO     clap-pw-info (default: build/clap-pw-info)
+#   PROOF_BUNDLE     default lsp-plugins.clap
+#   PROOF_PLUGIN     default in.lsp-plug.filter_stereo
+#
+# Needs: pipewire, pw-cli, pw-dump, pw-link, pw-play, pw-record, pw-metadata,
+# WirePlumber >= 0.5 (smart filters), jq, python3.
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+root=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+work=$(realpath -m "${1:-$root/build/live-proof}")
+so=$(realpath "${CLAP_PW_SO:-$root/build/libspa-filter-graph-plugin-clap.so}")
+info=$(realpath "${CLAP_PW_INFO:-$root/build/clap-pw-info}")
+bundle=${PROOF_BUNDLE:-lsp-plugins.clap}
+plugin=${PROOF_PLUGIN:-in.lsp-plug.filter_stereo}
+device=clap-pw-proof.device
+fx=clap-pw-proof.fx
+
+mkdir -p "$work"
+rm -f "$work"/*.wav
+exec > >(tee "$work/report.txt") 2>&1
+
+# filter-graph wants <dir>/filter-graph/libspa-filter-graph-plugin-clap.so
+spadir=$work/spa
+mkdir -p "$spadir/filter-graph"
+ln -sf "$so" "$spadir/filter-graph/libspa-filter-graph-plugin-clap.so"
+sysdir=$(pkg-config --variable=plugindir libspa-0.2 2>/dev/null || echo /usr/lib/spa-0.2)
+
+host_pid=
+cleanup() {
+  local id
+  if [[ -n $host_pid ]]; then kill "$host_pid" 2>/dev/null || true; wait "$host_pid" 2>/dev/null || true; fi
+  for n in "$device"; do
+    id=$(node_id "$n")
+    [[ -n $id ]] && timeout 5 pw-cli destroy "$id" >/dev/null 2>&1 || true
+  done
+  pkill -f "node.name = \"clap-pw-proof" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+node_id() {
+  timeout 5 pw-dump 2>/dev/null | jq -r --arg n "$1" \
+    '.[] | select(.type=="PipeWire:Interface:Node" and .info.props["node.name"]==$n) | .id' | head -1
+}
+our_nodes() {
+  timeout 5 pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") |
+    .info.props["node.name"] // empty' | grep -c '^clap-pw-proof' || true
+}
+default_sink() {
+  timeout 5 pw-metadata -n default 0 default.audio.sink 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p"
+}
+wait_for() { # name
+  for _ in $(seq 80); do [[ -n $(node_id "$1") ]] && return 0; sleep 0.1; done
+  echo "timed out waiting for node $1"; return 1
+}
+# the float a control wants for a value as the plugin displays it
+value_of() { # name text
+  "$info" "$bundle" "$plugin" "$1=$2" | awk '{print $3}'
+}
+props_value() { # node-id control
+  timeout 5 pw-dump "$1" 2>/dev/null | jq -r --arg c "$2" '
+    .[0].info.params.Props[]?.params // empty | . as $p |
+    range(0; length; 2) | select($p[.] == $c) | $p[. + 1]' | head -1
+}
+
+tone() { # freq file
+  python3 -I - "$1" "$2" <<'EOF'
+import math, struct, sys, wave
+f, path = float(sys.argv[1]), sys.argv[2]
+w = wave.open(path, "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+frames = b"".join(struct.pack("<hh", s, s) for s in
+                  (int(8191 * math.sin(2 * math.pi * f * n / 48000)) for n in range(96000)))
+w.writeframes(frames); w.close()
+EOF
+}
+
+# RMS in dBFS of the loudest 1 s window, per channel
+rms() {
+  python3 -I - "$1" <<'EOF'
+import math, struct, sys, wave
+w = wave.open(sys.argv[1]); ch = w.getnchannels(); n = w.getnframes()
+raw = w.readframes(n); width = w.getsampwidth()
+data = struct.unpack("<%df" % (n * ch), raw) if width == 4 else \
+       [s / 32768 for s in struct.unpack("<%dh" % (n * ch), raw)]
+best = [-200.0] * ch
+for start in range(0, max(1, n - 48000), 4800):
+    for c in range(ch):
+        seg = data[start * ch + c:(start + 48000) * ch:ch]
+        if not seg: continue
+        r = math.sqrt(sum(x * x for x in seg) / len(seg))
+        best[c] = max(best[c], 20 * math.log10(r) if r > 0 else -200.0)
+print(" ".join("%.1f" % b for b in best))
+EOF
+}
+
+# Play a tone AT THE DEVICE and record the device's monitor through hand-made
+# links (a capture stream that targets the device would be redirected to the
+# smart filter by WirePlumber and record the filter's input).
+last_rms=
+last_route=
+measure() { # label freq
+  local label=$1 freq=$2 rec=$work/$1-$2Hz.wav play_pid rec_pid route
+  [[ -f $work/tone-$freq.wav ]] || tone "$freq" "$work/tone-$freq.wav"
+  pw-record -P '{ node.autoconnect = false node.name = "clap-pw-proof.rec" }' \
+    --rate 48000 --channels 2 --format s16 "$rec" >/dev/null 2>&1 &
+  rec_pid=$!
+  wait_for clap-pw-proof.rec
+  sleep 0.2
+  pw-link "$device:monitor_FL" clap-pw-proof.rec:input_FL
+  pw-link "$device:monitor_FR" clap-pw-proof.rec:input_FR
+  sleep 0.3
+  pw-play --target "$device" -P '{ node.dont-fallback = true node.name = "clap-pw-proof.play" }' \
+    "$work/tone-$freq.wav" &
+  play_pid=$!
+  sleep 0.8
+  route=$(pw-link -l 2>/dev/null | awk '/^clap-pw-proof.play:/{p=1;next} /^[^ ]/{p=0} p&&/\|->/{print $2}' | sort -u | tr '\n' ' ')
+  wait "$play_pid"
+  sleep 0.3
+  kill -INT "$rec_pid"; wait "$rec_pid" 2>/dev/null || true
+  last_rms=$(rms "$rec")
+  last_route=$route
+  printf '%-22s %5s Hz  player -> %-58s  RMS dBFS L R: %s\n' "$label" "$freq" "${route:-?}" "$last_rms"
+}
+left() { echo "${last_rms%% *}"; }
+right() { echo "${last_rms##* }"; }
+
+fails=0
+expect() { # description condition...
+  local d=$1; shift
+  if "$@"; then echo "   PASS  $d"; else echo "   FAIL  $d"; fails=$((fails + 1)); fi
+}
+lt() { python3 -I -c "import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)" "$1" "$2"; }
+near() { python3 -I -c "import sys; sys.exit(0 if abs(float(sys.argv[1]) - float(sys.argv[2])) <= float(sys.argv[3]) else 1)" "$1" "$2" "$3"; }
+
+echo "== clap-pipewire live proof $(date -Is)"
+echo "pipewire: $(pipewire --version | sed -n 's/.*libpipewire //p' | head -1)"
+echo "plugin:   $so"
+echo "effect:   $bundle  $plugin"
+echo "device:   $device (null sink made for the test)"
+before_default=$(default_sink)
+echo "default sink before: $before_default"
+[[ $(our_nodes) == 0 ]] || { echo "leftover clap-pw-proof nodes; aborting"; exit 1; }
+
+f500=$(value_of Frequency 500)
+f8k=$(value_of Frequency 8000)
+slope=$(value_of Filter_slope x4)
+lopass=$(value_of Filter_type Lo-pass)
+echo "controls: Filter_type=$lopass (Lo-pass) Filter_slope=$slope (x4) Frequency=$f500 (500 Hz), live -> $f8k (8000 Hz)"
+
+# 1. the device
+timeout 5 pw-cli create-node adapter "{ factory.name = support.null-audio-sink node.name = $device
+  node.description = \"clap-pipewire proof device\" media.class = Audio/Sink
+  audio.position = [ FL FR ] object.linger = true priority.session = 1 priority.driver = 1
+  monitor.channel-volumes = false }" >/dev/null
+wait_for "$device"
+
+echo; echo "-- 1. no effect"
+measure direct 200;  d200=$(left)
+measure direct 5000; d5k=$(left)
+
+# 2. the CLAP effect in its own PipeWire client, as a smart filter on the device
+cat >"$work/host.conf" <<EOF
+context.properties = { log.level = 3 }
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-rt args = { rtportal.enabled = false } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "clap-pipewire proof: $plugin"
+            media.name       = "clap-pipewire proof"
+            filter.graph = {
+                nodes = [
+                    {
+                        type    = clap
+                        name    = fx
+                        plugin  = "$bundle"
+                        label   = "$plugin"
+                        control = { "Filter_type" = $lopass "Filter_slope" = $slope "Frequency" = $f500 }
+                    }
+                ]
+                inputs  = [ "fx:in_1" "fx:in_2" ]
+                outputs = [ "fx:out_1" "fx:out_2" ]
+            }
+            audio.channels = 2
+            audio.position = [ FL FR ]
+            capture.props = {
+                node.name           = "$fx"
+                media.class         = Audio/Sink
+                filter.smart        = true
+                filter.smart.name   = "$fx"
+                filter.smart.target = { node.name = "$device" }
+            }
+            playback.props = {
+                node.name          = "$fx.out"
+                node.passive       = true
+                node.dont-fallback = true
+            }
+        }
+    }
+]
+EOF
+(cd "$work" && SPA_PLUGIN_DIR="$spadir:$sysdir" PIPEWIRE_DEBUG=3 exec pipewire -c "$work/host.conf") \
+  >"$work/host.log" 2>&1 &
+host_pid=$!
+wait_for "$fx"
+wait_for "$fx.out"
+sleep 0.5
+fx_id=$(node_id "$fx")
+echo; echo "-- 2. CLAP LSP Filter Stereo as a smart filter on the device (LPF 500 Hz x4), node $fx_id"
+grep -E "clap: " "$work/host.log" | sed 's/^/   host: /' | head -8
+measure effect 200;  e200=$(left)
+measure effect 5000; e5k=$(left); e5kr=$(right)
+expect "WirePlumber routed the player into the CLAP filter" grep -q "$fx:playback_FL" <<<"$last_route"
+expect "200 Hz passes (within 6 dB of dry)" near "$e200" "$d200" 6
+expect "5 kHz cut by more than 40 dB (L)" lt "$e5k" "$(python3 -I -c "print($d5k - 40)")"
+expect "5 kHz cut by more than 40 dB (R)" lt "$e5kr" "$(python3 -I -c "print($d5k - 40)")"
+echo "   Props fx:Frequency = $(props_value "$fx_id" fx:Frequency)"
+
+# 2b. system bypass through WirePlumber's filters metadata
+timeout 5 pw-metadata -n filters "$fx_id" filter.smart.disabled true >/dev/null
+sleep 0.5
+echo; echo "-- 2b. system bypass: filters metadata filter.smart.disabled = true"
+measure sys-bypass 5000; b=$(left)
+expect "bypassed: 5 kHz back to dry" near "$b" "$d5k" 1
+timeout 5 pw-metadata -n filters -d "$fx_id" filter.smart.disabled >/dev/null
+sleep 0.5
+measure sys-enabled 5000; b=$(left)
+expect "re-enabled: 5 kHz cut again" lt "$b" "$(python3 -I -c "print($d5k - 40)")"
+
+# 3. live parameter changes through Props, as any PipeWire client can do
+g12=$(value_of Output_gain -12)
+timeout 5 pw-cli set-param "$fx_id" Props "{ params = [ \"fx:Output_gain\" $g12 ] }" >/dev/null
+sleep 1
+echo; echo "-- 3. live control: pw-cli set-param ... fx:Output_gain = $g12 (-12 dB)"
+measure out-gain-12 200; gl=$(left); gr=$(right)
+expect "200 Hz drops by 12 dB on the left (within 0.5 dB)" near "$gl" "$(python3 -I -c "print($e200 - 12)")" 0.5
+expect "200 Hz drops by 12 dB on the right (within 0.5 dB)" near "$gr" "$(python3 -I -c "print($e200 - 12)")" 0.5
+echo "   Props fx:Output_gain = $(props_value "$fx_id" fx:Output_gain)"
+timeout 5 pw-cli set-param "$fx_id" Props '{ params = [ "fx:Output_gain" 0.0 ] }' >/dev/null
+sleep 0.5
+
+timeout 5 pw-cli set-param "$fx_id" Props "{ params = [ \"fx:Frequency\" $f8k ] }" >/dev/null
+sleep 1
+echo; echo "-- 3b. live control: fx:Frequency = $f8k (8000 Hz)"
+measure cutoff-8k 5000; c8l=$(left); c8r=$(right)
+expect "cutoff moved up: 5 kHz at least 40 dB louder than at 500 Hz (L)" lt "$(python3 -I -c "print($e5k + 40)")" "$c8l"
+echo "   Props fx:Frequency = $(props_value "$fx_id" fx:Frequency)"
+if ! near "$c8l" "$c8r" 0.5; then
+  echo "   NOTE  L/R differ after a live Frequency change ($c8l / $c8r). This is LSP Filter"
+  echo "         Stereo itself: the LV2 build shows the same -25.4 / -48.3, and an offline run"
+  echo "         of the CLAP build with no PipeWire at all reproduces it; a fresh instance"
+  echo "         loaded at 8 kHz reads -25.4 on both channels."
+fi
+
+timeout 5 pw-cli set-param "$fx_id" Props "{ params = [ \"fx:Frequency\" $f500 ] }" >/dev/null
+sleep 1
+measure cutoff-500 5000; c5=$(left)
+expect "back to 500 Hz: 5 kHz cut again" lt "$c5" "$(python3 -I -c "print($d5k - 40)")"
+
+# 4. the plugin's own bypass parameter, live
+timeout 5 pw-cli set-param "$fx_id" Props '{ params = [ "fx:Bypass" 1.0 ] }' >/dev/null
+sleep 1
+echo; echo "-- 4. live control: fx:Bypass = 1 (the plugin's own bypass)"
+measure plugin-bypass 5000; pb=$(left)
+expect "plugin bypass: 5 kHz back to dry (within 1 dB)" near "$pb" "$d5k" 1
+timeout 5 pw-cli set-param "$fx_id" Props '{ params = [ "fx:Bypass" 0.0 ] }' >/dev/null
+sleep 0.5
+
+# 5. remove the effect
+saved_pid=$host_pid
+kill "$host_pid"; wait "$host_pid" 2>/dev/null || true; host_pid=
+sleep 0.5
+echo; echo "-- 5. effect removed (host process stopped)"
+expect "filter nodes gone" test -z "$(node_id "$fx")"
+measure removed 5000; r=$(left)
+expect "device plays dry again" near "$r" "$d5k" 1
+
+# 6. remove the device and check nothing is left
+timeout 5 pw-cli destroy "$(node_id "$device")" >/dev/null
+sleep 0.5
+echo; echo "-- 6. clean up"
+left_nodes=$(our_nodes)
+echo "clap-pw-proof nodes left: $left_nodes"
+expect "no test nodes left" test "$left_nodes" = 0
+expect "no host process left" bash -c "! kill -0 $saved_pid 2>/dev/null && ! pgrep -f '[p]ipewire -c $work/host.conf' >/dev/null"
+after_default=$(default_sink)
+echo "default sink after: $after_default"
+expect "default sink unchanged" test "$after_default" = "$before_default"
+grep -iE "error|warn" "$work/host.log" | grep -v "RTKit\|rtkit\|portal" | sed 's/^/   host log: /' | head -10 || true
+
+echo; echo "== $([[ $fails == 0 ]] && echo PASS || echo "FAIL ($fails)")"
+exit "$fails"

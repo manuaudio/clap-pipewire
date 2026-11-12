@@ -1,0 +1,42 @@
+#!/bin/sh
+# clap-pw-host: run a filter-chain config that uses `type = clap` nodes as its
+# own PipeWire client, with this project's filter-graph plugin on the SPA path.
+#
+#   clap-pw-host my-effect             # ~/.config/clap-pipewire/my-effect.conf
+#   clap-pw-host /path/to/effect.conf
+#
+# Stopping the process removes the effect; nothing else in the session restarts.
+# SPDX-License-Identifier: MIT
+set -eu
+
+plugindir="@SPA_PLUGINDIR@"
+sysdir="${CLAP_PW_SYSTEM_SPA_DIR:-@SYSTEM_SPA_PLUGINDIR@}"
+confdir="${XDG_CONFIG_HOME:-$HOME/.config}/clap-pipewire"
+
+if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+	echo "usage: clap-pw-host CONFIG   (a path, or a name in $confdir)" >&2
+	exit 2
+fi
+
+conf=$1
+if [ ! -f "$conf" ]; then
+	for c in "$confdir/$1" "$confdir/$1.conf"; do
+		if [ -f "$c" ]; then conf=$c; break; fi
+	done
+fi
+if [ ! -f "$conf" ]; then
+	echo "clap-pw-host: no config '$1' (looked in . and $confdir)" >&2
+	exit 1
+fi
+conf=$(realpath "$conf")
+
+if [ ! -f "$plugindir/filter-graph/libspa-filter-graph-plugin-clap.so" ]; then
+	echo "clap-pw-host: plugin not installed in $plugindir/filter-graph" >&2
+	exit 1
+fi
+
+# filter-graph resolves `type = clap` in every directory of SPA_PLUGIN_DIR;
+# everything else still comes from the system directory.
+SPA_PLUGIN_DIR="$plugindir:${SPA_PLUGIN_DIR:-$sysdir}"
+export SPA_PLUGIN_DIR
+exec pipewire -c "$conf"

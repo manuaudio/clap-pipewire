@@ -1,0 +1,87 @@
+#!/bin/bash
+# check-examples: run each shipped example config through clap-pw-host against
+# a throwaway null-sink device, check the CLAP effect loads and audio goes
+# through it, then remove everything. Nothing reaches real hardware: the
+# examples' targets are rewritten to the test device and pinned with
+# node.dont-fallback.
+#
+# Usage: tools/check-examples [CLAP_PW_HOST]   (default: clap-pw-host in PATH)
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+root=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+host_bin=${1:-$(command -v clap-pw-host)}
+work=$root/build/check-examples
+device=clap-pw-check.device
+mkdir -p "$work"
+
+pids=()
+cleanup() {
+  local p id
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+  id=$(node_id "$device")
+  [[ -n $id ]] && timeout 5 pw-cli destroy "$id" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+node_id() {
+  timeout 5 pw-dump 2>/dev/null | jq -r --arg n "$1" \
+    '.[] | select(.type=="PipeWire:Interface:Node" and .info.props["node.name"]==$n) | .id' | head -1
+}
+wait_for() {
+  for _ in $(seq 80); do [[ -n $(node_id "$1") ]] && return 0; sleep 0.1; done
+  return 1
+}
+default_sink() {
+  timeout 5 pw-metadata -n default 0 default.audio.sink 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p"
+}
+
+before=$(default_sink)
+timeout 5 pw-cli create-node adapter "{ factory.name = support.null-audio-sink node.name = $device
+  node.description = \"clap-pipewire check device\" media.class = Audio/Sink
+  audio.position = [ FL FR ] object.linger = true priority.session = 1 priority.driver = 1
+  monitor.channel-volumes = false }" >/dev/null
+wait_for "$device"
+
+fails=0
+check() { # example input-node
+  local ex=$1 input=$2 conf=$work/$1 pid ok=1
+  # point the example at the test device, and never fall back elsewhere
+  sed -e "s|alsa_output.CHANGE-ME|$device|" \
+      -e "s|node.passive *= true|node.passive = true target.object = \"$device\" node.dont-fallback = true|" \
+      "$root/examples/$ex" >"$conf"
+  PIPEWIRE_DEBUG=3 "$host_bin" "$conf" >"$conf.log" 2>&1 &
+  pid=$!
+  pids+=("$pid")
+  wait_for "$input" || ok=0
+  sleep 0.5
+  # play a short tone into the effect's input and confirm the plugin ran
+  if [[ $ok == 1 ]]; then
+    timeout 10 pw-play --target "$input" -P '{ node.dont-fallback = true node.name = "clap-pw-check.play" }' \
+      "$root/build/live-proof/tone-200.wav" >/dev/null 2>&1 || ok=0
+  fi
+  grep -q "clap: instantiated" "$conf.log" || ok=0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  sleep 0.3
+  [[ -z $(node_id "$input") ]] || ok=0
+  if [[ $ok == 1 ]]; then echo "PASS  $ex"; else echo "FAIL  $ex (see $conf.log)"; fails=$((fails + 1)); fi
+}
+
+[[ -f $root/build/live-proof/tone-200.wav ]] || {
+  python3 -I -c '
+import math, struct, sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+w.writeframes(b"".join(struct.pack("<hh", s, s) for s in (int(8191 * math.sin(2 * math.pi * 200 * n / 48000)) for n in range(48000))))
+w.close()' "$work/tone-200.wav"
+  mkdir -p "$root/build/live-proof"; cp "$work/tone-200.wav" "$root/build/live-proof/"
+}
+
+check clap-sink.conf effect_input.clap
+check clap-smart-filter.conf clap-fx.device-filter
+
+timeout 5 pw-cli destroy "$(node_id "$device")" >/dev/null
+sleep 0.3
+after=$(default_sink)
+[[ $after == "$before" ]] && echo "PASS  default sink unchanged" || { echo "FAIL  default sink changed"; fails=$((fails + 1)); }
+exit "$fails"
