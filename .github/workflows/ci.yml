@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 5 * * 1'   # weekly: catch PipeWire header/ABI drift early
+
+jobs:
+  build:
+    name: build + unit tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - name: Install PipeWire headers and toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git meson ninja clang libpipewire
+      - uses: actions/checkout@v4
+      - name: Configure (ASan + UBSan)
+        run: CC=${{ matrix.cc }} meson setup build -Db_sanitize=address,undefined -Db_lundef=false
+      - name: Build
+        run: meson compile -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
+      - name: Install into a user prefix
+        run: |
+          meson setup build-user --prefix="$PWD/prefix" -Dtests=false
+          meson install -C build-user
+          test -f prefix/lib/spa-0.2/filter-graph/libspa-filter-graph-plugin-clap.so
+          test -x prefix/bin/clap-pw-host
+
+  abi:
+    name: filter-graph plugin ABI
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install PipeWire headers
+        run: pacman -Syu --noconfirm --needed curl diffutils libpipewire pkgconf
+      - uses: actions/checkout@v4
+      - name: Vendored audio-plugin.h matches the PipeWire release we build against
+        run: |
+          v=$(pkg-config --modversion libpipewire-0.3)
+          echo "PipeWire $v"
+          sed '4,10d' src/fga/audio-plugin.h > vendored.h
+          curl -fsSL "https://gitlab.freedesktop.org/pipewire/pipewire/-/raw/$v/spa/plugins/filter-graph/audio-plugin.h" -o release.h
+          diff -u release.h vendored.h
+      - name: Compare with PipeWire master (warning only)
+        run: |
+          curl -fsSL "https://gitlab.freedesktop.org/pipewire/pipewire/-/raw/master/spa/plugins/filter-graph/audio-plugin.h" -o master.h
+          if ! diff -u master.h vendored.h; then
+            echo "::warning::audio-plugin.h on PipeWire master differs from the vendored 1.6 copy"
+          fi
